@@ -11,6 +11,11 @@ import requests
 from bs4 import BeautifulSoup
 import telebot
 
+
+
+from flask import Flask
+import os
+import threading
 # ========= НАСТРОЙКИ =========
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8578807833:AAGAK3_09G212WCDyxZbjbXVCE6l5YKNLnI")
 INPUT_SHEET = "Модели"           # во входном файле: колонки "Модель", "Моя цена"
@@ -276,7 +281,54 @@ def handle_docs(message):
     except Exception:
         pass
 
+# Добавьте Flask app для порта
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+def run_flask():
+    app.run(host='0.0.0.0', port=5000)
+
+def run_bot():
+    bot.polling(none_stop=True)
+
+# ---------------- Keep Alive ----------------
+import asyncio
+from aiohttp import ClientSession
+import threading
+
+async def keep_alive():
+    """Периодически пингует указанный URL каждые 5 минут"""
+    url = "https://kufar-uggb.onrender.com"  # замени на свой адрес
+
+    while True:
+        try:
+            async with ClientSession() as session:
+                async with session.get(url) as resp:
+                    print(f"[KeepAlive] Ping {url} → {resp.status}")
+        except Exception as e:
+            print(f"[KeepAlive] Ошибка пинга: {e}")
+        await asyncio.sleep(300)  # 5 минут
+
+def start_keep_alive():
+    asyncio.run(keep_alive())
+
 # ========= ЗАПУСК =========
 if __name__ == "__main__":
-    print("Bot is running.")
-    bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
+
+    # Запускаем Flask в отдельном потоке
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    #asyncio.run(keep_alive())
+    
+    # keep_alive — тоже в отдельном потоке
+    keepalive_thread = threading.Thread(target=start_keep_alive, daemon=True)
+    keepalive_thread.start()
+
+    run_bot()
+
+    #print("Bot is running.")
+    #bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)

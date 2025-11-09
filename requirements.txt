@@ -4,3 +4,6 @@ openpyxl
 requests
 beautifulsoup4
 lxml
+flask
+asyncio
+aiohttp
