@@ -19,7 +19,7 @@ import asyncio
 from aiohttp import ClientSession
 
 # ========= НАСТРОЙКИ =========
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8578807833:AAGAK3_09G212WCDyxZbjbXVCE6l5YKNLnI")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8217717739:AAG2XMv-sKCFPi3FywLXZ1EDd_tw8HRVmfg")
 INPUT_SHEET = "Модели"           # во входном файле: колонки "Модель", "Моя цена"
 COL_MODEL = "Модель"
 COL_MYPRICE = "Моя цена"
@@ -299,6 +299,7 @@ def process_excel_file(input_path: str,
 @bot.message_handler(commands=["start", "help"])
 def send_welcome(message):
     bot.reply_to(message,
+        "Коммит 3\n"
         "Пришлите Excel (.xlsx) с листом «Модели» и колонками:\n"
         "• Модель\n• Моя цена\n\n"
         "Я верну файл «Подгружаемая_таблица.xlsx» с 5 карточками по каждой модели.\n"
