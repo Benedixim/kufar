@@ -292,7 +292,12 @@ def run_flask():
     app.run(host='0.0.0.0', port=5000)
 
 def run_bot():
-    bot.polling(none_stop=True)
+    #bot.polling(none_stop=True)
+    bot.infinity_polling(
+        timeout=60,                # socket timeout
+        long_polling_timeout=60,   # сервер держит коннект не дольше
+        skip_pending=True
+    )
 
 # ---------------- Keep Alive ----------------
 import asyncio
