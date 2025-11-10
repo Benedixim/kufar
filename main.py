@@ -2,12 +2,10 @@ import os
 import re
 import time
 import tempfile
-import statistics
 import urllib.parse
-from typing import List, Dict, Optional, Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Optional
 import threading
-import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import requests
@@ -17,44 +15,40 @@ import telebot
 from flask import Flask
 import asyncio
 from aiohttp import ClientSession
+import random
 
 # ========= НАСТРОЙКИ =========
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8217717739:AAG2XMv-sKCFPi3FywLXZ1EDd_tw8HRVmfg")
-INPUT_SHEET = "Модели"           # во входном файле: колонки "Модель", "Моя цена"
-COL_MODEL = "Модель"
-COL_MYPRICE = "Моя цена"
-OUTPUT_SHEET = "Подгружаемая таблица"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8578807833:AAGAK3_09G212WCDyxZbjbXVCE6l5YKNLnI")
 
-# HTTP
+# Базовый URL аккаунта (можно переопределить аргументом /scan <url>)
+ACCOUNT_URL = "https://www.kufar.by/user/Os104G9aSmGvPEWHIflMWVI?cmp=1&cnd=2&sort=lst.d"
+
+# HTTP заголовки
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
     "Accept-Language": "ru-RU,ru;q=0.9",
     "Referer": "https://www.kufar.by/",
 }
 
-# CSS классы (по твоим примерам)
+# CSS-классы (из твоего примера)
+CARD_LEFT_CLASS = "styles_left__Y6ROt"
 PRICE_CONTAINER_CLASS = "styles_price_block__Ql9um"
 PRICE_CLASS = "styles_price__aVxZc"
-SELLER_CLASSES = ["styles_secondary__MzdEb", "styles_company_name__IyHuU"]
-AD_BUTTON_WRAPPER_CLASS = "styles_button__wrapper__BNF9t"
-CALL_BUTTON_TEXT = "Позвонить"
+TITLE_CLASS = "styles_title__Gx6CG"
 
-SCRAPE_LIMIT_PER_MODEL = 30
-KEEP_TOP_N = 5
+# Пагинация
+PAGINATION_WRAP_CLASS = "styles_pagination__inner__ekQUL"  # data-cy="account-listing-pagination"
+PAGE_LINK_CLASS = "styles_link__MzdxS"
+ARROW_LINK_CLASS = "styles_arrow-link__O5iAx"  # у "стрелок" (< и >)
 
-# Параллельность
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "6"))
-EDIT_THROTTLE_SECONDS = 1.0
+# Параллелизм для ускорения (по страницам)
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
 PROGRESS_BAR_LEN = 24
+EDIT_THROTTLE_SECONDS = 0.8
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode=None)
 
-# ========= ПАРСЕР =========
-def kufar_search_url(query: str) -> str:
-    base = "https://www.kufar.by/l/r~minsk/deshevo"
-    params = {"cmp": "1", "cnd": "2", "query": query}
-    return f"{base}?{urllib.parse.urlencode(params)}"
-
+# ========= УТИЛИТЫ =========
 def norm_space(s: Optional[str]) -> str:
     if not s:
         return ""
@@ -72,145 +66,185 @@ def parse_price_text(s: str) -> Optional[float]:
     except Exception:
         return None
 
-def extract_title(card: BeautifulSoup) -> str:
-    for sel in ["h3", "h2", "a", "span"]:
-        el = card.select_one(sel)
-        if el and norm_space(el.get_text()):
-            return norm_space(el.get_text())
-    return ""
-
-def extract_price(card: BeautifulSoup) -> Optional[float]:
-    block = card.find("div", class_=PRICE_CONTAINER_CLASS)
-    if block:
-        p = block.find("p", class_=PRICE_CLASS)
-        if p:
-            span = p.find("span")
-            if span:
-                return parse_price_text(span.get_text())
-        pr = parse_price_text(block.get_text(" ", strip=True))
-        if pr is not None:
-            return pr
-    return parse_price_text(card.get_text(" ", strip=True))
-
-def extract_seller(card: BeautifulSoup) -> str:
-    el = card.find("span", class_=lambda c: c and all(cls in c.split() for cls in SELLER_CLASSES))
-    if el:
-        return norm_space(el.get_text().replace("Продавец:", "").strip())
-    cand = card.find("span", string=lambda t: t and "Продавец" in t)
-    if cand:
-        return norm_space(cand.get_text().replace("Продавец:", "").strip())
-    return ""
-
-def extract_url(card: BeautifulSoup) -> str:
-    a = card.find("a", href=True)
-    if not a:
-        return ""
-    href = a["href"]
+def abs_url(href: str) -> str:
     if href.startswith("/"):
-        href = urllib.parse.urljoin("https://www.kufar.by", href)
+        return urllib.parse.urljoin("https://www.kufar.by", href)
     return href
 
-def is_ad_card(card: BeautifulSoup) -> bool:
-    wrapper = card.find("div", class_=AD_BUTTON_WRAPPER_CLASS)
-    if wrapper and wrapper.find(string=lambda t: t and CALL_BUTTON_TEXT in t):
-        return True
-    if card.find(["button", "a", "span"], string=lambda t: t and CALL_BUTTON_TEXT in t):
-        return True
-    if card.find(string=lambda t: t and "Реклама" in t):
-        return True
-    return False
-
-def select_cards(soup: BeautifulSoup) -> List[BeautifulSoup]:
-    cards = []
-    seen = set()
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/item/" not in href:
-            continue
-        container = a.find_parent(["article", "section", "li", "div"]) or a
-        full_href = href if not href.startswith("/") else urllib.parse.urljoin("https://www.kufar.by", href)
-        if full_href in seen:
-            continue
-        seen.add(full_href)
-        cards.append(container)
-    return cards
-
 def safe_get(url: str, timeout: float = 25.0) -> requests.Response:
-    # мягкий джиттер, чтобы не ударять синхронно по серверу при параллелизме
-    time.sleep(random.uniform(0.1, 0.3))
+    # чуть-чуть джиттера, чтобы не долбить синхронно
+    time.sleep(random.uniform(0.05, 0.2))
     return requests.get(url, headers=HEADERS, timeout=timeout)
 
-def fetch_raw_rows(model: str) -> List[Dict]:
-    url = kufar_search_url(model)
-    r = safe_get(url, timeout=25)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+def render_bar(done: int, total: int) -> str:
+    if total <= 0:
+        return ""
+    pct = int(done * 100 / total)
+    filled = int(PROGRESS_BAR_LEN * done / total)
+    return f"[{'█'*filled}{'░'*(PROGRESS_BAR_LEN-filled)}] {pct}%"
+
+# ========= ПАРСИНГ СТРАНИЦЫ СПИСКА =========
+def parse_list_page(html: str, page_url: str) -> Dict:
+    """
+    Возвращает:
+      items: List[Dict{Название, Цена, Ссылка}]
+      next_url: str | None
+      pages: List[str] (все видимые ссылки-страницы; нужно для общего плана)
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Карточки
+    items: List[Dict] = []
+    for left in soup.find_all("div", class_=CARD_LEFT_CLASS):
+        # Цена
+        price_val = None
+        price_block = left.find("div", class_=PRICE_CONTAINER_CLASS)
+        if price_block:
+            p = price_block.find("p", class_=PRICE_CLASS)
+            if p:
+                span = p.find("span")
+                if span:
+                    price_val = parse_price_text(span.get_text())
+            if price_val is None:
+                price_val = parse_price_text(price_block.get_text(" ", strip=True))
+
+        # Название
+        title_el = left.find("h3", class_=TITLE_CLASS)
+        title = norm_space(title_el.get_text()) if title_el else ""
+
+        # Ссылка (ищем ближайшую родительскую <a href="/item/...">)
+        link = ""
+        a = left.find_parent().find("a", href=True) if left.find_parent() else None
+        if a and "/item/" in a["href"]:
+            link = abs_url(a["href"])
+        else:
+            # запасной поиск внутри соседних контейнеров
+            a2 = left.find("a", href=True)
+            if a2 and "/item/" in a2["href"]:
+                link = abs_url(a2["href"])
+
+        if not (title or price_val or link):
+            continue
+
+        items.append({
+            "Название": title,
+            "Цена, BYN": price_val,
+            "Ссылка": link
+        })
+
+    # Пагинация
+    next_url = None
+    pages_seen: List[str] = []
+    pwrap = soup.find("div", class_=PAGINATION_WRAP_CLASS)
+    if pwrap:
+        links = pwrap.find_all("a", class_=PAGE_LINK_CLASS, href=True)
+        for a in links:
+            href = abs_url(a["href"])
+            pages_seen.append(href)
+        # эвристика "next": ссылка-стрелка справа (имеет класс styles_arrow-link__O5iAx и href)
+        right_arrows = pwrap.find_all("a", class_=lambda c: c and ARROW_LINK_CLASS in c.split(), href=True)
+        if right_arrows:
+            # берём последнюю стрелку (вправо)
+            next_url = abs_url(right_arrows[-1]["href"])
+
+        # иногда "стрелка" есть, но она ведёт на текущую/предыдущую — на всякий случай фильтр:
+        if next_url and next_url == page_url:
+            next_url = None
+
+    return {"items": items, "next_url": next_url, "pages": pages_seen}
+
+def discover_all_pages(start_url: str) -> List[str]:
+    """
+    Сначала грузим первую страницу, собираем видимые номера,
+    потом идём по "стрелке" next, пока есть.
+    """
+    visited = set()
+    to_visit = [start_url]
+    all_pages = []
+
+    while to_visit:
+        url = to_visit.pop(0)
+        if url in visited:
+            continue
+        r = safe_get(url, timeout=25)
+        r.raise_for_status()
+        parsed = parse_list_page(r.text, url)
+        all_pages.append(url)
+        visited.add(url)
+
+        # если есть next — добавим в очередь
+        nxt = parsed.get("next_url")
+        if nxt and nxt not in visited and nxt not in to_visit:
+            to_visit.append(nxt)
+
+        # также смотрим явные номера страниц, чтобы не пропустить
+        for p in parsed.get("pages", []):
+            if p not in visited and p not in to_visit:
+                to_visit.append(p)
+
+    # уникализируем с сохранением порядка
+    seen = set()
+    ordered = []
+    for u in all_pages:
+        if u not in seen:
+            seen.add(u)
+            ordered.append(u)
+    return ordered
+
+def scrape_account(url: str,
+                   progress_cb: Optional[callable] = None) -> pd.DataFrame:
+    """
+    Обходит все страницы аккаунта и собирает товары: Название, Цена, Ссылка, Страница.
+    Страницы ходим параллельно для ускорения.
+    """
+    pages = discover_all_pages(url)
+    total = len(pages)
+    done = 0
+    lock = threading.Lock()
+    last_edit = 0.0
 
     rows: List[Dict] = []
-    for card in select_cards(soup):
-        if is_ad_card(card):
-            continue
-        title = extract_title(card)
-        price = extract_price(card)
-        seller = extract_seller(card)
-        link = extract_url(card)
-        if not (title or price or seller or link):
-            continue
-        rows.append({"Товар": model, "Цена, BYN": price, "Продавец": seller, "Ссылка": link, "Название": title})
-        if len(rows) >= SCRAPE_LIMIT_PER_MODEL:
-            break
-    return rows
 
-def remove_low_outliers(rows: List[Dict]) -> List[Dict]:
-    prices = [r["Цена, BYN"] for r in rows if isinstance(r.get("Цена, BYN"), (int, float))]
-    if len(prices) < 3:
-        return rows
-    prices_sorted = sorted(prices)
-    median = statistics.median(prices_sorted)
-    q1 = statistics.median(prices_sorted[:len(prices_sorted)//2])
-    q3 = statistics.median(prices_sorted[(len(prices_sorted)+1)//2:])
-    iqr = q3 - q1
-    lower_bound = max(q1 - 1.5 * iqr, 0.1 * median, 0)
-    return [r for r in rows if (r.get("Цена, BYN") is None) or (r["Цена, BYN"] >= lower_bound)]
+    def _update():
+        nonlocal last_edit
+        now = time.time()
+        if progress_cb and (now - last_edit >= EDIT_THROTTLE_SECONDS or done == total):
+            progress_cb(done, total)
+            last_edit = now
 
-def format_block_for_excel(model: str, my_price: Optional[float], comp_rows: List[Dict], keep_n: int = 5) -> List[Dict]:
-    rows_sorted = sorted(comp_rows, key=lambda r: 10**12 if r["Цена, BYN"] is None else r["Цена, BYN"])[:keep_n]
-    comp_prices = [r["Цена, BYN"] for r in rows_sorted if isinstance(r.get("Цена, BYN"), (int, float))]
-    min_price = min(comp_prices) if comp_prices else None
+    def process_page(purl: str) -> List[Dict]:
+        r = safe_get(purl, timeout=25)
+        r.raise_for_status()
+        parsed = parse_list_page(r.text, purl)
+        out = []
+        for it in parsed["items"]:
+            out.append({
+                "Название": it["Название"],
+                "Цена, BYN": it["Цена, BYN"],
+                "Ссылка": it["Ссылка"],
+                "Страница": purl
+            })
+        return out
 
-    diff = None
-    if my_price is not None and min_price is not None:
-        diff = my_price - min_price
+    # Параллельно по страницам
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(process_page, p): p for p in pages}
+        for fut in as_completed(futures):
+            page_rows = []
+            try:
+                page_rows = fut.result()
+            except Exception:
+                page_rows = []
+            with lock:
+                rows.extend(page_rows)
+                done += 1
+                _update()
 
-    rec = ""
-    if diff is not None:
-        if diff > 0:
-            rec = "снизить цену"
-        elif diff < 0:
-            rec = "повысить цену"
-        else:
-            rec = "оставить без изменений"
-
-    out_rows: List[Dict] = []
-    for idx in range(keep_n):
-        r = rows_sorted[idx] if idx < len(rows_sorted) else None
-        row = {
-            "Товар": model if idx == 0 else "",
-            "Моя цена": my_price if idx == 0 else "",
-            "Цены конкурентов": (r["Цена, BYN"] if r else ""),
-            "Названия конкурентов": (r["Продавец"] if r and r["Продавец"] else (r["Название"] if r else "")),
-            "Минимальная цена": min_price if idx == 0 else "",
-            "Разница": diff if idx == 0 else "",
-            "Рекомендация": rec if idx == 0 else "",
-            "Ссылка": (r["Ссылка"] if r else ""),
-        }
-        out_rows.append(row)
-    return out_rows
-
-def process_model(model: str, my_price: Optional[float]) -> List[Dict]:
-    raw = fetch_raw_rows(model)
-    clean = remove_low_outliers(raw)
-    return format_block_for_excel(model, my_price, clean, keep_n=KEEP_TOP_N)
+    df = pd.DataFrame(rows, columns=["Название", "Цена, BYN", "Ссылка", "Страница"])
+    # можно отсортировать, например, по убыванию даты (страницы уже в порядке переходов),
+    # но надёжнее — по цене возрастанию:
+    df = df.sort_values(by=["Цена, BYN", "Название"], na_position="last").reset_index(drop=True)
+    return df
 
 def _colname(i: int) -> str:
     name = ""
@@ -226,147 +260,75 @@ def autosize_columns(writer, df: pd.DataFrame, sheet_name: str):
         width = min(int(max_len * 1.2) + 2, 80)
         ws.column_dimensions[_colname(i)].width = width
 
-# ========= ПРОГРЕСС И ПАРАЛЛЕЛИЗАЦИЯ =========
-def render_bar(done: int, total: int) -> str:
-    if total <= 0:
-        return ""
-    pct = int(done * 100 / total)
-    filled = int(PROGRESS_BAR_LEN * done / total)
-    return f"[{'█'*filled}{'░'*(PROGRESS_BAR_LEN-filled)}] {pct}%"
-
-def process_excel_file(input_path: str,
-                       progress_cb: Optional[Callable[[int, int], None]] = None,
-                       max_workers: int = MAX_WORKERS) -> str:
-    src = pd.read_excel(input_path, sheet_name=INPUT_SHEET)
-    if COL_MODEL not in src.columns:
-        raise ValueError(f'В листе "{INPUT_SHEET}" нет колонки "{COL_MODEL}"')
-    if COL_MYPRICE not in src.columns:
-        raise ValueError(f'В листе "{INPUT_SHEET}" нет колонки "{COL_MYPRICE}"')
-
-    tasks: List[tuple[str, Optional[float]]] = []
-    for _, rec in src.iterrows():
-        model = norm_space(str(rec[COL_MODEL]))
-        my_price = rec[COL_MYPRICE]
-        my_price = float(my_price) if pd.notna(my_price) else None
-        if model:
-            tasks.append((model, my_price))
-
-    total = len(tasks)
-    done = 0
-    lock = threading.Lock()
-    rows_all: List[Dict] = []
-
-    last_edit = 0.0
-
-    def _update():
-        nonlocal last_edit
-        now = time.time()
-        if progress_cb and (now - last_edit >= EDIT_THROTTLE_SECONDS or done == total):
-            progress_cb(done, total)
-            last_edit = now
-
-    # Пул потоков
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {
-            ex.submit(process_model, model, my_price): (model, my_price)
-            for (model, my_price) in tasks
-        }
-        for fut in as_completed(futures):
-            result_rows = []
-            err = None
-            try:
-                result_rows = fut.result()
-            except Exception as e:
-                err = e
-            with lock:
-                if err is None and result_rows:
-                    rows_all.extend(result_rows)
-                done += 1
-                _update()
-
-    out_df = pd.DataFrame(rows_all, columns=[
-        "Товар", "Моя цена", "Цены конкурентов", "Названия конкурентов",
-        "Минимальная цена", "Разница", "Рекомендация", "Ссылка"
-    ])
-
-    out_path = os.path.join(tempfile.gettempdir(), f"Подгружаемая_таблица_{int(time.time())}.xlsx")
+def export_excel(df: pd.DataFrame) -> str:
+    out_path = os.path.join(tempfile.gettempdir(), f"Товары_{int(time.time())}.xlsx")
     with pd.ExcelWriter(out_path, engine="openpyxl") as w:
-        out_df.to_excel(w, sheet_name=OUTPUT_SHEET, index=False)
-        autosize_columns(w, out_df, OUTPUT_SHEET)
+        df.to_excel(w, sheet_name="Товары", index=False)
+        autosize_columns(w, df, "Товары")
     return out_path
 
 # ========= ХЕНДЛЕРЫ =========
 @bot.message_handler(commands=["start", "help"])
 def send_welcome(message):
     bot.reply_to(message,
-        "Коммит 3\n"
-        "Пришлите Excel (.xlsx) с листом «Модели» и колонками:\n"
-        "• Модель\n• Моя цена\n\n"
-        "Я верну файл «Подгружаемая_таблица.xlsx» с 5 карточками по каждой модели.\n"
-        "Пока считаю — покажу прогресс."
+        "Команда:\n"
+        "• /scan — собрать все товары со страницы аккаунта и вернуть Excel.\n\n"
+        "Можно указать свой URL:\n"
+        "/scan https://www.kufar.by/user/XXXXX?cmp=1&cnd=2&sort=lst.d\n"
+        "Пока считаю — покажу прогресс по страницам."
     )
 
-@bot.message_handler(content_types=["document"])
-def handle_docs(message):
-    doc = message.document
-    if not doc.file_name.lower().endswith(".xlsx"):
-        bot.reply_to(message, "Нужен файл .xlsx. Пришлите корректный файл.")
-        return
+@bot.message_handler(commands=["scan"])
+def on_scan(message):
+    # парсим аргумент URL, если передан
+    parts = message.text.split(maxsplit=1)
+    url = ACCOUNT_URL
+    if len(parts) == 2 and parts[1].startswith("http"):
+        url = parts[1].strip()
 
-    # статус-сообщение + будем его редактировать
-    status = bot.reply_to(message, "Файл получен, обрабатываю…\n[░░░░░░░░░░░░░░░░░░░░░░] 0%")
+    status = bot.reply_to(message, "Начинаю сканирование…\n[░░░░░░░░░░░░░░░░░░░░░░] 0%")
 
     try:
-        # скачиваем во временный файл
-        f_info = bot.get_file(doc.file_id)
-        tmp_in = os.path.join(tempfile.gettempdir(), f"{int(time.time())}_{doc.file_name}")
-        downloaded = bot.download_file(f_info.file_path)
-        with open(tmp_in, "wb") as f:
-            f.write(downloaded)
-
-        # прогресс-коллбэк
         def progress_cb(done: int, total: int):
             bar = render_bar(done, total)
             try:
                 bot.edit_message_text(
                     chat_id=message.chat.id,
                     message_id=status.message_id,
-                    text=f"Обрабатываю модели…\n{bar}"
+                    text=f"Обработка страниц: {done}/{total}\n{bar}"
                 )
             except Exception:
                 pass
 
-        # обработка (параллельно)
-        tmp_out = process_excel_file(tmp_in, progress_cb=progress_cb, max_workers=MAX_WORKERS)
+        df = scrape_account(url, progress_cb=progress_cb)
+        xlsx_path = export_excel(df)
 
-        # финальный апдейт прогресса
         try:
             bot.edit_message_text(
                 chat_id=message.chat.id,
                 message_id=status.message_id,
-                text="Готовлю файл к отправке… ✅"
+                text=f"Найдено позиций: {len(df)}. Готовлю файл… ✅"
             )
         except Exception:
             pass
 
-        # отправка результата
-        with open(tmp_out, "rb") as f:
+        with open(xlsx_path, "rb") as f:
             bot.send_document(
                 message.chat.id, f,
-                visible_file_name="Подгружаемая_таблица.xlsx",
+                visible_file_name="Товары.xlsx",
                 caption="Готово ✅"
             )
 
     except Exception as e:
         bot.reply_to(message, f"Ошибка: {e}")
 
-    # попытка убрать статус-сообщение
+    # пробуем удалить статус
     try:
         bot.delete_message(chat_id=message.chat.id, message_id=status.message_id)
     except Exception:
         pass
 
-# ========= Flask keep-alive =========
+# ========= Flask keep-alive (опционально) =========
 app = Flask(__name__)
 
 @app.route('/')
@@ -377,8 +339,7 @@ def run_flask():
     app.run(host='0.0.0.0', port=int(os.getenv("PORT", "5000")))
 
 async def keep_alive():
-    """Периодически пингует указанный URL каждые 5 минут"""
-    url = os.getenv("KEEPALIVE_URL", "")  # при необходимости выставь переменную окружения
+    url = os.getenv("KEEPALIVE_URL", "")
     if not url:
         return
     while True:
@@ -395,14 +356,9 @@ def start_keep_alive():
 
 # ========= ЗАПУСК =========
 if __name__ == "__main__":
-    # Flask в отдельном потоке
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    # фоновые сервисы (если нужны)
+    threading.Thread(target=run_flask, daemon=True).start()
+    threading.Thread(target=start_keep_alive, daemon=True).start()
 
-    # keep-alive (опционально)
-    keepalive_thread = threading.Thread(target=start_keep_alive, daemon=True)
-    keepalive_thread.start()
-
-    # сам бот
     print("Bot is running.")
     bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
