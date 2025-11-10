@@ -171,6 +171,41 @@ def discover_all_pages(start_url: str) -> List[str]:
             out.append(u)
     return out
 
+def dedupe_models(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Оставляем по одному экземпляру каждого товара.
+    Приоритетный ключ — ссылка. Если её нет, используем (нормализованный заголовок, цена).
+    """
+    if df.empty:
+        return df
+
+    out = df.copy()
+
+    # подготовим ключи
+    out["link_key"] = out.get("Ссылка", "").fillna("").astype(str).str.strip()
+
+    title_col = out.get("Модель", out.get("Название", ""))
+    out["title_key"] = (
+        title_col.fillna("").astype(str)
+        .str.lower()
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
+
+    out["price_key"] = pd.to_numeric(out.get("Моя цена", None), errors="coerce").fillna(-1).astype("Int64")
+
+    # 1) все строки со ссылкой — по одной на link_key
+    with_link = out[out["link_key"] != ""].drop_duplicates(subset=["link_key"], keep="first")
+
+    # 2) строки без ссылки — по одной на (title_key, price_key)
+    no_link = out[out["link_key"] == ""].drop_duplicates(subset=["title_key", "price_key"], keep="first")
+
+    # склеиваем и чистим служебные поля
+    out = pd.concat([with_link, no_link], ignore_index=True)
+    out = out.drop(columns=["link_key", "title_key", "price_key"], errors="ignore")
+
+    return out
+
 def scrape_account_models(url: str, progress_cb: Optional[Callable[[int, int, str], None]] = None) -> pd.DataFrame:
     pages = discover_all_pages(url)
     total = len(pages)
@@ -211,6 +246,14 @@ def scrape_account_models(url: str, progress_cb: Optional[Callable[[int, int, st
     # чистим NaN/типы
     if "Моя цена" in df.columns:
         df["Моя цена"] = pd.to_numeric(df["Моя цена"], errors="coerce")
+
+
+    # >>> добавь вот это:
+    before = len(df)
+    df = dedupe_models(df)
+    after = len(df)
+    print(f"[scrape_account_models] найдено: {before}, после удаления дублей: {after}")
+
     return df[["Модель", "Моя цена", "Ссылка", "Страница"]]
 
 # ========= ШАГ 2. Анализ конкурентов (как раньше) =========
