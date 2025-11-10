@@ -4,18 +4,20 @@ import time
 import tempfile
 import statistics
 import urllib.parse
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import random
 
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 import telebot
 
-
-
 from flask import Flask
-import os
-import threading
+import asyncio
+from aiohttp import ClientSession
+
 # ========= НАСТРОЙКИ =========
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8578807833:AAGAK3_09G212WCDyxZbjbXVCE6l5YKNLnI")
 INPUT_SHEET = "Модели"           # во входном файле: колонки "Модель", "Моя цена"
@@ -39,6 +41,11 @@ CALL_BUTTON_TEXT = "Позвонить"
 
 SCRAPE_LIMIT_PER_MODEL = 30
 KEEP_TOP_N = 5
+
+# Параллельность
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "6"))
+EDIT_THROTTLE_SECONDS = 1.0
+PROGRESS_BAR_LEN = 24
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode=None)
 
@@ -128,9 +135,14 @@ def select_cards(soup: BeautifulSoup) -> List[BeautifulSoup]:
         cards.append(container)
     return cards
 
+def safe_get(url: str, timeout: float = 25.0) -> requests.Response:
+    # мягкий джиттер, чтобы не ударять синхронно по серверу при параллелизме
+    time.sleep(random.uniform(0.1, 0.3))
+    return requests.get(url, headers=HEADERS, timeout=timeout)
+
 def fetch_raw_rows(model: str) -> List[Dict]:
     url = kufar_search_url(model)
-    r = requests.get(url, headers=HEADERS, timeout=25)
+    r = safe_get(url, timeout=25)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
@@ -214,20 +226,63 @@ def autosize_columns(writer, df: pd.DataFrame, sheet_name: str):
         width = min(int(max_len * 1.2) + 2, 80)
         ws.column_dimensions[_colname(i)].width = width
 
-def process_excel_file(input_path: str) -> str:
+# ========= ПРОГРЕСС И ПАРАЛЛЕЛИЗАЦИЯ =========
+def render_bar(done: int, total: int) -> str:
+    if total <= 0:
+        return ""
+    pct = int(done * 100 / total)
+    filled = int(PROGRESS_BAR_LEN * done / total)
+    return f"[{'█'*filled}{'░'*(PROGRESS_BAR_LEN-filled)}] {pct}%"
+
+def process_excel_file(input_path: str,
+                       progress_cb: Optional[Callable[[int, int], None]] = None,
+                       max_workers: int = MAX_WORKERS) -> str:
     src = pd.read_excel(input_path, sheet_name=INPUT_SHEET)
     if COL_MODEL not in src.columns:
         raise ValueError(f'В листе "{INPUT_SHEET}" нет колонки "{COL_MODEL}"')
     if COL_MYPRICE not in src.columns:
         raise ValueError(f'В листе "{INPUT_SHEET}" нет колонки "{COL_MYPRICE}"')
 
-    rows_all: List[Dict] = []
+    tasks: List[tuple[str, Optional[float]]] = []
     for _, rec in src.iterrows():
         model = norm_space(str(rec[COL_MODEL]))
         my_price = rec[COL_MYPRICE]
         my_price = float(my_price) if pd.notna(my_price) else None
-        rows_all.extend(process_model(model, my_price))
-        time.sleep(1.0)
+        if model:
+            tasks.append((model, my_price))
+
+    total = len(tasks)
+    done = 0
+    lock = threading.Lock()
+    rows_all: List[Dict] = []
+
+    last_edit = 0.0
+
+    def _update():
+        nonlocal last_edit
+        now = time.time()
+        if progress_cb and (now - last_edit >= EDIT_THROTTLE_SECONDS or done == total):
+            progress_cb(done, total)
+            last_edit = now
+
+    # Пул потоков
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {
+            ex.submit(process_model, model, my_price): (model, my_price)
+            for (model, my_price) in tasks
+        }
+        for fut in as_completed(futures):
+            result_rows = []
+            err = None
+            try:
+                result_rows = fut.result()
+            except Exception as e:
+                err = e
+            with lock:
+                if err is None and result_rows:
+                    rows_all.extend(result_rows)
+                done += 1
+                _update()
 
     out_df = pd.DataFrame(rows_all, columns=[
         "Товар", "Моя цена", "Цены конкурентов", "Названия конкурентов",
@@ -246,7 +301,8 @@ def send_welcome(message):
     bot.reply_to(message,
         "Пришлите Excel (.xlsx) с листом «Модели» и колонками:\n"
         "• Модель\n• Моя цена\n\n"
-        "Я верну файл «Подгружаемая_таблица.xlsx» с 5 карточками по каждой модели."
+        "Я верну файл «Подгружаемая_таблица.xlsx» с 5 карточками по каждой модели.\n"
+        "Пока считаю — покажу прогресс."
     )
 
 @bot.message_handler(content_types=["document"])
@@ -256,7 +312,8 @@ def handle_docs(message):
         bot.reply_to(message, "Нужен файл .xlsx. Пришлите корректный файл.")
         return
 
-    status = bot.reply_to(message, "Файл получен, обрабатываю…")
+    # статус-сообщение + будем его редактировать
+    status = bot.reply_to(message, "Файл получен, обрабатываю…\n[░░░░░░░░░░░░░░░░░░░░░░] 0%")
 
     try:
         # скачиваем во временный файл
@@ -266,22 +323,49 @@ def handle_docs(message):
         with open(tmp_in, "wb") as f:
             f.write(downloaded)
 
-        # обработка
-        tmp_out = process_excel_file(tmp_in)
+        # прогресс-коллбэк
+        def progress_cb(done: int, total: int):
+            bar = render_bar(done, total)
+            try:
+                bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=status.message_id,
+                    text=f"Обрабатываю модели…\n{bar}"
+                )
+            except Exception:
+                pass
+
+        # обработка (параллельно)
+        tmp_out = process_excel_file(tmp_in, progress_cb=progress_cb, max_workers=MAX_WORKERS)
+
+        # финальный апдейт прогресса
+        try:
+            bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=status.message_id,
+                text="Готовлю файл к отправке… ✅"
+            )
+        except Exception:
+            pass
 
         # отправка результата
         with open(tmp_out, "rb") as f:
-            bot.send_document(message.chat.id, f, visible_file_name="Подгружаемая_таблица.xlsx", caption="Готово ✅")
+            bot.send_document(
+                message.chat.id, f,
+                visible_file_name="Подгружаемая_таблица.xlsx",
+                caption="Готово ✅"
+            )
 
     except Exception as e:
         bot.reply_to(message, f"Ошибка: {e}")
 
+    # попытка убрать статус-сообщение
     try:
         bot.delete_message(chat_id=message.chat.id, message_id=status.message_id)
     except Exception:
         pass
 
-# Добавьте Flask app для порта
+# ========= Flask keep-alive =========
 app = Flask(__name__)
 
 @app.route('/')
@@ -289,25 +373,13 @@ def home():
     return "Bot is running!"
 
 def run_flask():
-    app.run(host='0.0.0.0', port=5000)
-
-def run_bot():
-    #bot.polling(none_stop=True)
-    bot.infinity_polling(
-        timeout=60,                # socket timeout
-        long_polling_timeout=60,   # сервер держит коннект не дольше
-        skip_pending=True
-    )
-
-# ---------------- Keep Alive ----------------
-import asyncio
-from aiohttp import ClientSession
-import threading
+    app.run(host='0.0.0.0', port=int(os.getenv("PORT", "5000")))
 
 async def keep_alive():
     """Периодически пингует указанный URL каждые 5 минут"""
-    url = "https://kufar-uggb.onrender.com"  # замени на свой адрес
-
+    url = os.getenv("KEEPALIVE_URL", "")  # при необходимости выставь переменную окружения
+    if not url:
+        return
     while True:
         try:
             async with ClientSession() as session:
@@ -315,25 +387,21 @@ async def keep_alive():
                     print(f"[KeepAlive] Ping {url} → {resp.status}")
         except Exception as e:
             print(f"[KeepAlive] Ошибка пинга: {e}")
-        await asyncio.sleep(300)  # 5 минут
+        await asyncio.sleep(300)
 
 def start_keep_alive():
     asyncio.run(keep_alive())
 
 # ========= ЗАПУСК =========
 if __name__ == "__main__":
-
-    # Запускаем Flask в отдельном потоке
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
+    # Flask в отдельном потоке
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    #asyncio.run(keep_alive())
-    
-    # keep_alive — тоже в отдельном потоке
+
+    # keep-alive (опционально)
     keepalive_thread = threading.Thread(target=start_keep_alive, daemon=True)
     keepalive_thread.start()
 
-    run_bot()
-
-    #print("Bot is running.")
-    #bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
+    # сам бот
+    print("Bot is running.")
+    bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
