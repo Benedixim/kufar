@@ -534,7 +534,7 @@ def run_flask():
     app.run(host='0.0.0.0', port=int(os.getenv("PORT", "5000")))
 
 async def keep_alive():
-    url = os.getenv("KEEPALIVE_URL", "")
+    url = os.getenv("KEEPALIVE_URL", "https://kufar-uggb.onrender.com/")
     if not url:
         return
     while True:
