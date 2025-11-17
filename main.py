@@ -312,20 +312,51 @@ def is_ad_card(card: BeautifulSoup) -> bool:
         return True
     return False
 
+# # проблема удвоения
+# def select_cards(soup: BeautifulSoup) -> List[BeautifulSoup]:
+#     cards = []
+#     seen = set()
+#     for a in soup.find_all("a", href=True):
+#         href = a["href"]
+#         if "/item/" not in href:
+#             continue
+#         container = a.find_parent(["article", "section", "li", "div"]) or a
+#         full_href = href if not href.startswith("/") else urllib.parse.urljoin("https://www.kufar.by", href)
+#         if full_href in seen:
+#             continue
+#         seen.add(full_href)
+#         cards.append(container)
+#     return cards
 def select_cards(soup: BeautifulSoup) -> List[BeautifulSoup]:
-    cards = []
-    seen = set()
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/item/" not in href:
-            continue
-        container = a.find_parent(["article", "section", "li", "div"]) or a
-        full_href = href if not href.startswith("/") else urllib.parse.urljoin("https://www.kufar.by", href)
-        if full_href in seen:
-            continue
-        seen.add(full_href)
-        cards.append(container)
+    cards: List[BeautifulSoup] = []
+    seen: set[str] = set()
+
+    # Берём только область с карточками
+    wrappers = soup.find_all("div", class_="styles_wrapper__G_0_A")
+    if not wrappers:
+        wrappers = [soup]  # фолбэк, если верстка изменилась
+
+    for scope in wrappers:
+        # Ищем ссылки на товар внутри этой области
+        for a in scope.select('a[href*="/item/"]'):
+            href = a.get("href", "")
+            full_href = href if not href.startswith("/") else urllib.parse.urljoin("https://www.kufar.by", href)
+            if full_href in seen:
+                continue
+            seen.add(full_href)
+
+            # Поднимаемся к ближайшему контейнеру карточки
+            container = a
+            for tag in ("article", "section", "li", "div"):
+                parent = a.find_parent(tag)
+                if parent:
+                    container = parent
+                    break
+
+            cards.append(container)
+
     return cards
+
 
 def fetch_raw_rows(model: str) -> List[Dict]:
     url = kufar_search_url(model)
