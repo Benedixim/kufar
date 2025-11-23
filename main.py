@@ -21,9 +21,10 @@ from aiohttp import ClientSession
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8578807833:AAGAK3_09G212WCDyxZbjbXVCE6l5YKNLnI")
 
 # страница аккаунта по умолчанию (можно передать свою в /run <url>)
-ACCOUNT_URL = "https://www.kufar.by/user/Os104G9aSmGvPEWHIflMWVI?cmp=1&cnd=2&sort=lst.d"
+#
+# ACCOUNT_URL = ""
 
-OUTPUT_SHEET = "Подгружаемая таблица"
+OUTPUT_SHEET = "Выгрузка"
 
 # HTTP
 HEADERS = {
@@ -357,6 +358,15 @@ def select_cards(soup: BeautifulSoup) -> List[BeautifulSoup]:
 
     return cards
 
+def clean_title(title: str) -> str:
+    # убираем хвосты типа ГАРАНТИЯ, НОВЫЕ, НОВЫЙ, ОРИГИНАЛ, ВСЕ ЦВЕТА в конце строки
+    title = re.sub(
+        r"(\s*,?\s*(ГАРАНТИЯ|НОВЫЕ|НОВЫЙ|ОРИГИНАЛ|ВСЕ ЦВЕТА))*\s*$", 
+        "", 
+        title, 
+        flags=re.IGNORECASE
+    )
+    return title.strip(" ,")
 
 def fetch_raw_rows(model: str) -> List[Dict]:
     url = kufar_search_url(model)
@@ -369,9 +379,13 @@ def fetch_raw_rows(model: str) -> List[Dict]:
         if is_ad_card(card):
             continue
         title = extract_title(card)
+        title = clean_title(title)
+
         price = extract_price(card)
         seller = extract_seller(card)
         link = extract_url(card)
+        link = link.split("?", 1)[0]  # ← вот это обрежет всё после ?
+        
         if not (title or price or seller or link):
             continue
         rows.append({"Товар": model, "Цена, BYN": price, "Продавец": seller, "Ссылка": link, "Название": title})
@@ -547,7 +561,13 @@ def save_url(message):
             df_out = process_models_df(df_models, progress_cb=progress_cb, max_workers=MAX_WORKERS)
 
             # 3) Экспорт
-            xlsx_path = export_excel(df_out, sheet=OUTPUT_SHEET, name_prefix="Подгружаемая_таблица")
+            from datetime import datetime
+
+            # 3) Экспорт
+            date_suffix = datetime.now().strftime("%d-%m-%Y")   # или "%d-%m-%Y_%H-%M" если нужно с временем
+            xlsx_path = export_excel(df_out, sheet=OUTPUT_SHEET, name_prefix=f"Выгрузка на {date_suffix}")
+
+            #xlsx_path = export_excel(df_out, sheet=OUTPUT_SHEET, name_prefix="Выгрузка на")
 
             try:
                 bot.edit_message_text(chat_id=message.chat.id, message_id=status.message_id,
