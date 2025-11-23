@@ -581,7 +581,7 @@ def save_url(message):
 
             with open(xlsx_path, "rb") as f:
                 bot.send_document(message.chat.id, f,
-                                visible_file_name=f"Выгрузка на {date_suffix}",
+                                visible_file_name=f"Выгрузка на {date_suffix}.xlsx",
                                 caption="Готово ✅")
 
         except Exception as e:
