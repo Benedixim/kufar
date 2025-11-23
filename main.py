@@ -93,6 +93,16 @@ def render_bar(done: int, total: int) -> str:
     return f"[{'█'*filled}{'░'*(PROGRESS_BAR_LEN-filled)}] {pct}%"
 
 # ========= ШАГ 1. Скан аккаунта (Название, Моя цена) =========
+def clean_title(title: str) -> str:
+    # убираем хвосты типа ГАРАНТИЯ, НОВЫЕ, НОВЫЙ, ОРИГИНАЛ, ВСЕ ЦВЕТА в конце строки
+    title = re.sub(
+        r"(\s*,?\s*(ГАРАНТИЯ|НОВЫЕ|НОВЫЙ|ОРИГИНАЛ|ВСЕ ЦВЕТА))*\s*$", 
+        "", 
+        title, 
+        flags=re.IGNORECASE
+    )
+    return title.strip(" ,")
+
 def parse_account_list_page(html: str, page_url: str) -> Dict:
     soup = BeautifulSoup(html, "html.parser")
     items: List[Dict] = []
@@ -113,6 +123,8 @@ def parse_account_list_page(html: str, page_url: str) -> Dict:
         # название
         title_el = left.find("h3", class_=TITLE_CLASS)
         title = norm_space(title_el.get_text()) if title_el else ""
+        # тут 
+        title = clean_title(title)
 
         # ссылка на товар
         link = ""
@@ -358,15 +370,7 @@ def select_cards(soup: BeautifulSoup) -> List[BeautifulSoup]:
 
     return cards
 
-def clean_title(title: str) -> str:
-    # убираем хвосты типа ГАРАНТИЯ, НОВЫЕ, НОВЫЙ, ОРИГИНАЛ, ВСЕ ЦВЕТА в конце строки
-    title = re.sub(
-        r"(\s*,?\s*(ГАРАНТИЯ|НОВЫЕ|НОВЫЙ|ОРИГИНАЛ|ВСЕ ЦВЕТА))*\s*$", 
-        "", 
-        title, 
-        flags=re.IGNORECASE
-    )
-    return title.strip(" ,")
+
 
 def fetch_raw_rows(model: str) -> List[Dict]:
     url = kufar_search_url(model)
@@ -379,7 +383,7 @@ def fetch_raw_rows(model: str) -> List[Dict]:
         if is_ad_card(card):
             continue
         title = extract_title(card)
-        title = clean_title(title)
+        #title = clean_title(title)
 
         price = extract_price(card)
         seller = extract_seller(card)
@@ -577,7 +581,7 @@ def save_url(message):
 
             with open(xlsx_path, "rb") as f:
                 bot.send_document(message.chat.id, f,
-                                visible_file_name="Подгружаемая_таблица.xlsx",
+                                visible_file_name=f"Выгрузка на {date_suffix}",
                                 caption="Готово ✅")
 
         except Exception as e:
