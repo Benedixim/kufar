@@ -498,61 +498,79 @@ def start_msg(message):
         "Покажу прогресс по двум этапам."
     )
 
+
 @bot.message_handler(commands=["run"])
 def run_full(message):
-    # читаем URL если передан
-    parts = message.text.split(maxsplit=1)
-    url = ACCOUNT_URL
-    if len(parts) == 2 and parts[1].startswith("http"):
-        url = parts[1].strip()
+    # Всегда спрашиваем ссылку, не читаем из аргументов команды
+    bot.send_message(message.chat.id, "Укажите ссылку на аккаунт:")
+    bot.register_next_step_handler(message, save_url)
 
-    status = bot.reply_to(message, "Шаг 1/2: собираю ваши товары…\n" + render_bar(0, 1))
+def save_url(message):
+    # # читаем URL если передан
+    # parts = message.text.split(maxsplit=1)
+    # url = ACCOUNT_URL
+    # if len(parts) == 2 and parts[1].startswith("http"):
+    #     url = parts[1].strip()
 
-    try:
-        # общий прогресс-коллбэк
-        def progress_cb(done: int, total: int, phase: str):
-            bar = render_bar(done, total)
+    text = message.text.strip()
+
+    if text.startswith("http"):
+        url = text
+        #bot.send_message(message.chat.id, f"Ссылка сохранена: {ACCOUNT_URL}")
+        # тут можешь вызвать основную часть логики, если нужно
+        
+
+        status = bot.reply_to(message, "Шаг 1/2: собираю ваши товары…\n" + render_bar(0, 1))
+
+        try:
+            # общий прогресс-коллбэк
+            def progress_cb(done: int, total: int, phase: str):
+                bar = render_bar(done, total)
+                try:
+                    bot.edit_message_text(
+                        chat_id=message.chat.id,
+                        message_id=status.message_id,
+                        text=f"{phase}\n{bar}"
+                    )
+                except Exception:
+                    pass
+
+            # 1) Скан аккаунта -> df_models (Модель, Моя цена)
+            df_models = scrape_account_models(url, progress_cb=progress_cb)
+            if df_models.empty:
+                bot.edit_message_text(chat_id=message.chat.id, message_id=status.message_id,
+                                    text="Не нашёл товаров на странице аккаунта.")
+                return
+
+            # 2) Анализ рынка по этим моделям
+            progress_cb(0, len(df_models), "Шаг 2/2: анализ рынка")
+            df_out = process_models_df(df_models, progress_cb=progress_cb, max_workers=MAX_WORKERS)
+
+            # 3) Экспорт
+            xlsx_path = export_excel(df_out, sheet=OUTPUT_SHEET, name_prefix="Подгружаемая_таблица")
+
             try:
-                bot.edit_message_text(
-                    chat_id=message.chat.id,
-                    message_id=status.message_id,
-                    text=f"{phase}\n{bar}"
-                )
+                bot.edit_message_text(chat_id=message.chat.id, message_id=status.message_id,
+                                    text=f"Готовлю файл к отправке… ✅")
             except Exception:
                 pass
 
-        # 1) Скан аккаунта -> df_models (Модель, Моя цена)
-        df_models = scrape_account_models(url, progress_cb=progress_cb)
-        if df_models.empty:
-            bot.edit_message_text(chat_id=message.chat.id, message_id=status.message_id,
-                                  text="Не нашёл товаров на странице аккаунта.")
-            return
+            with open(xlsx_path, "rb") as f:
+                bot.send_document(message.chat.id, f,
+                                visible_file_name="Подгружаемая_таблица.xlsx",
+                                caption="Готово ✅")
 
-        # 2) Анализ рынка по этим моделям
-        progress_cb(0, len(df_models), "Шаг 2/2: анализ рынка")
-        df_out = process_models_df(df_models, progress_cb=progress_cb, max_workers=MAX_WORKERS)
-
-        # 3) Экспорт
-        xlsx_path = export_excel(df_out, sheet=OUTPUT_SHEET, name_prefix="Подгружаемая_таблица")
+        except Exception as e:
+            bot.reply_to(message, f"Ошибка: {e}")
 
         try:
-            bot.edit_message_text(chat_id=message.chat.id, message_id=status.message_id,
-                                  text=f"Готовлю файл к отправке… ✅")
+            bot.delete_message(chat_id=message.chat.id, message_id=status.message_id)
         except Exception:
             pass
 
-        with open(xlsx_path, "rb") as f:
-            bot.send_document(message.chat.id, f,
-                              visible_file_name="Подгружаемая_таблица.xlsx",
-                              caption="Готово ✅")
-
-    except Exception as e:
-        bot.reply_to(message, f"Ошибка: {e}")
-
-    try:
-        bot.delete_message(chat_id=message.chat.id, message_id=status.message_id)
-    except Exception:
-        pass
+    else:
+        bot.send_message(message.chat.id, "Это не похоже на ссылку. Отправьте корректный URL:")
+        bot.register_next_step_handler(message, save_url)
 
 # ========= Flask keep-alive (опционально) =========
 app = Flask(__name__)
