@@ -569,7 +569,7 @@ def save_url(message):
 
             # 3) Экспорт
             date_suffix = datetime.now().strftime("%d-%m-%Y")   # или "%d-%m-%Y_%H-%M" если нужно с временем
-            xlsx_path = export_excel(df_out, sheet=OUTPUT_SHEET, name_prefix=f"Выгрузка на {date_suffix}")
+            xlsx_path = export_excel(df_out, sheet=OUTPUT_SHEET, name_prefix=f"Выгрузка на {date_suffix} .xlsx")
 
             #xlsx_path = export_excel(df_out, sheet=OUTPUT_SHEET, name_prefix="Выгрузка на")
 
@@ -581,7 +581,7 @@ def save_url(message):
 
             with open(xlsx_path, "rb") as f:
                 bot.send_document(message.chat.id, f,
-                                visible_file_name=f"Выгрузка на {date_suffix}.xlsx",
+                                visible_file_name=f"Выгрузка на {date_suffix} .xlsx",
                                 caption="Готово ✅")
 
         except Exception as e:
